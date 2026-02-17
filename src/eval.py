@@ -6,7 +6,12 @@ from tqdm import tqdm
 
 from .datasets import create_loader
 from .model_byol import BYOLModel
-from .calc_mahalanobis import load_mahala_pack, vectorize_temporal_feature, mahalanobis_distance
+from .calc_mahalanobis import (
+    cov_to_precision,
+    load_mahala_pack,
+    mahalanobis_distance,
+    vectorize_temporal_feature,
+)
 from .utils import ensure_dir, compute_roc_pr, plot_roc_pr, plot_confusion, plot_hist_by_class
 
 
@@ -42,6 +47,37 @@ def _score_loader(model, loader, pack, device, agg_method, topk_ratio):
     return np.asarray(all_scores, dtype=float), np.asarray(all_labels, dtype=int), all_paths
 
 
+@torch.no_grad()
+def _infer_feature_dim(model, loader, device):
+    for x, _, _ in loader:
+        feat = model.encode(x.to(device))
+        _, D, _ = feat.shape
+        return int(D)
+    raise ValueError("loader is empty; cannot infer feature dimension")
+
+
+@torch.no_grad()
+def _estimate_mahala_pack(model, loader, device, eps: float, use_pinv: bool):
+    vecs_all = []
+    for x, _, _ in tqdm(loader, desc="[fit-mahala]"):
+        feat = model.encode(x.to(device))
+        vecs, _ = vectorize_temporal_feature(feat)
+        vecs_all.append(vecs.to(dtype=torch.float32))
+
+    if not vecs_all:
+        raise ValueError("cannot estimate Mahalanobis stats from an empty loader")
+
+    x = torch.cat(vecs_all, dim=0)
+    mean = x.mean(dim=0)
+    xc = x - mean
+    cov = (xc.T @ xc) / max(1, (xc.size(0) - 1))
+    precision = cov_to_precision(cov, eps=eps, use_pinv=use_pinv)
+    return {
+        "mean": mean.to(device=device, dtype=torch.float32),
+        "precision": precision.to(device=device, dtype=torch.float32),
+    }
+
+
 def run_eval(cfg):
     """BYOL特徴→Mahalanobis距離で異常判定する評価ルーチン。"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -70,7 +106,21 @@ def run_eval(cfg):
     model.eval()
 
     # ===== Mahalanobis統計量 =====
-    pack = load_mahala_pack(cfg["mahala"]["stats_path"], device)
+    stats_path = cfg["mahala"].get("stats_path", "")
+    if not stats_path:
+        stats_path = os.path.join(out_dir, cfg["filenames"]["mahala_stats_pt"])
+    pack = load_mahala_pack(stats_path, device)
+
+    feat_dim = _infer_feature_dim(model, val_loader, device)
+    pack_dim = int(pack["mean"].numel())
+    if pack_dim != feat_dim:
+        eps = float(cfg["mahala"].get("eps", 1.0e-6))
+        use_pinv = bool(cfg["mahala"].get("use_pinv", True))
+        print(
+            f"[warn] Mahalanobis stats dim mismatch: model={feat_dim}, stats={pack_dim} ({stats_path}). "
+            "Re-estimating stats from train_ok loader."
+        )
+        pack = _estimate_mahala_pack(model, train_loader, device, eps=eps, use_pinv=use_pinv)
 
     agg_method = cfg["scoring"]["aggregate_method"]
     topk_ratio = float(cfg["scoring"]["topk_ratio"])
