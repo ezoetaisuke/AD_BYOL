@@ -12,7 +12,14 @@ from .calc_mahalanobis import (
     mahalanobis_distance,
     vectorize_temporal_feature,
 )
-from .utils import ensure_dir, compute_roc_pr, plot_roc_pr, plot_confusion, plot_hist_by_class
+from .utils import (
+    ensure_dir,
+    compute_roc_pr,
+    plot_roc_pr,
+    plot_confusion,
+    extract_subclass_from_path,
+    plot_hist_all_subclasses,
+)
 
 
 def _aggregate_time(per_t: np.ndarray, method: str, topk_ratio: float):
@@ -152,7 +159,17 @@ def run_eval(cfg):
     roc_pack, pr_pack = compute_roc_pr(y_true, y_score)
     plot_roc_pr(os.path.join(out_dir, cfg["filenames"]["roc_png"]), os.path.join(out_dir, cfg["filenames"]["pr_png"]), roc_pack, pr_pack)
     plot_confusion(os.path.join(out_dir, cfg["filenames"]["confusion_matrix_png"]), y_true, y_pred)
-    plot_hist_by_class(os.path.join(out_dir, cfg["filenames"]["score_hist_png"]), ok_scores, ng_scores)
+    subclass_groups = [extract_subclass_from_path(p) for p in paths]
+    hist_path = os.path.join(
+        out_dir,
+        cfg["filenames"].get("score_hist_all_subclasses_png", cfg["filenames"]["score_hist_png"]),
+    )
+    plot_hist_all_subclasses(
+        hist_path,
+        y_score,
+        subclass_groups,
+        title="Score Histogram (All Subclasses)",
+    )
 
     print(f"Eval done. threshold={threshold:.6f}, roc_auc={roc_pack[3]:.4f}")
     return {
