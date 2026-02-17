@@ -138,8 +138,8 @@ data:
 model:
   type: "byol"
   byol:
-    encoder_hidden: 64
     feat_dim: 128
+    pretrained_path: ""   # BYOL-A公式重み(.pth)。空ならランダム初期化
     projector_hidden: 256
     predictor_hidden: 256
     ema_decay: 0.99

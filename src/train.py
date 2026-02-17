@@ -21,13 +21,14 @@ def run_train(cfg):
 
     # ===== BYOLモデル初期化 =====
     byol_cfg = cfg["model"]["byol"]
+    n_mels = int(cfg["feature"]["logmel"]["n_mels"])
     model = BYOLModel(
-        in_ch=1,
-        encoder_hidden=byol_cfg["encoder_hidden"],
+        n_mels=n_mels,
         feat_dim=byol_cfg["feat_dim"],
         projector_hidden=byol_cfg["projector_hidden"],
         predictor_hidden=byol_cfg["predictor_hidden"],
         ema_decay=byol_cfg["ema_decay"],
+        pretrained_path=byol_cfg.get("pretrained_path", ""),
     ).to(device)
 
     augment = BYOLAugment(
