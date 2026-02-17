@@ -1,32 +1,53 @@
 import copy
+import importlib
+import inspect
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class TemporalFeatureEncoder(nn.Module):
-    """時間方向をできるだけ保持するため、時間方向はstride=1中心で畳み込みするエンコーダ。"""
+class _OfficialBYOLAEncoder(nn.Module):
+    """Wrap nttcslab/byol-a encoder and normalize output shape to [B,D,T]."""
 
-    def __init__(self, in_ch: int = 1, hidden_ch: int = 64, feat_dim: int = 128):
+    def __init__(self, n_mels: int, feat_dim: int, pretrained_path: str = ""):
         super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Conv2d(in_ch, hidden_ch, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(hidden_ch),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_ch, hidden_ch * 2, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(hidden_ch * 2),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(hidden_ch * 2, hidden_ch * 2, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(hidden_ch * 2),
-            nn.SiLU(inplace=True),
-        )
-        self.proj = nn.Conv1d(hidden_ch * 2, feat_dim, kernel_size=1)
+        self.encoder = self._build_encoder(n_mels=n_mels, feat_dim=feat_dim)
+        if pretrained_path:
+            state = torch.load(pretrained_path, map_location="cpu")
+            if isinstance(state, dict) and "model" in state:
+                state = state["model"]
+            self.encoder.load_state_dict(state, strict=False)
+
+    def _build_encoder(self, n_mels: int, feat_dim: int) -> nn.Module:
+        try:
+            models_mod = importlib.import_module("byol_a.models")
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                "byol_a package is required. Install BYOL-A from https://github.com/nttcslab/byol-a "
+                "and make sure `byol_a` is importable."
+            ) from e
+
+        if not hasattr(models_mod, "AudioNTT2020"):
+            raise AttributeError("byol_a.models.AudioNTT2020 is not available in the installed BYOL-A package")
+
+        cls = getattr(models_mod, "AudioNTT2020")
+        sig = inspect.signature(cls)
+        kwargs = {}
+        if "n_mels" in sig.parameters:
+            kwargs["n_mels"] = n_mels
+        if "d" in sig.parameters:
+            kwargs["d"] = feat_dim
+        elif "feat_dim" in sig.parameters:
+            kwargs["feat_dim"] = feat_dim
+        return cls(**kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.backbone(x)  # [B, C, F', T]
-        h = h.mean(dim=2)  # 周波数軸のみ平均化して時間軸Tは維持
-        z = self.proj(h)
-        return F.normalize(z, dim=1)  # [B, D, T]
+        h = self.encoder(x)
+        if h.dim() == 2:
+            h = h.unsqueeze(-1)  # [B,D] -> [B,D,1]
+        elif h.dim() == 3 and h.shape[1] < h.shape[2]:
+            h = h.transpose(1, 2)  # [B,T,D] -> [B,D,T]
+        return F.normalize(h, dim=1)
 
 
 class MLPHead(nn.Module):
@@ -44,19 +65,19 @@ class MLPHead(nn.Module):
 
 
 class BYOLModel(nn.Module):
-    """BYOL/BYOL-A共通で利用する自己教師ありモデル。"""
+    """BYOL-A official encoder + BYOL objective for anomaly-feature learning."""
 
     def __init__(
         self,
-        in_ch: int = 1,
-        encoder_hidden: int = 64,
+        n_mels: int,
         feat_dim: int = 128,
         projector_hidden: int = 256,
         predictor_hidden: int = 256,
         ema_decay: float = 0.99,
+        pretrained_path: str = "",
     ):
         super().__init__()
-        self.online_encoder = TemporalFeatureEncoder(in_ch, encoder_hidden, feat_dim)
+        self.online_encoder = _OfficialBYOLAEncoder(n_mels=n_mels, feat_dim=feat_dim, pretrained_path=pretrained_path)
         self.online_projector = MLPHead(feat_dim, projector_hidden)
         self.online_predictor = MLPHead(feat_dim, predictor_hidden)
 
@@ -103,9 +124,7 @@ class BYOLModel(nn.Module):
 
 
 class BYOLAugment:
-    """スペクトログラム向け簡易Augmentation。BYOL/BYOL-Aを設定で切替。"""
-
-    def __init__(self, mode: str = "byol", noise_std: float = 0.02, time_mask_ratio: float = 0.1, freq_mask_ratio: float = 0.1):
+    def __init__(self, mode: str = "byol-a", noise_std: float = 0.02, time_mask_ratio: float = 0.1, freq_mask_ratio: float = 0.1):
         self.mode = mode
         self.noise_std = noise_std
         self.time_mask_ratio = time_mask_ratio
@@ -128,14 +147,8 @@ class BYOLAugment:
     def __call__(self, x: torch.Tensor):
         v1 = x + self.noise_std * torch.randn_like(x)
         v2 = x + self.noise_std * torch.randn_like(x)
-        if self.mode == "byol-a":
-            # BYOL-A寄りに周波数マスクを強める
-            v1 = self._mask(v1, dim=2, ratio=self.freq_mask_ratio)
-            v2 = self._mask(v2, dim=2, ratio=self.freq_mask_ratio)
-            v1 = self._mask(v1, dim=3, ratio=self.time_mask_ratio * 0.5)
-            v2 = self._mask(v2, dim=3, ratio=self.time_mask_ratio * 0.5)
-        else:
-            # 通常BYOLは時間情報を残すため、時間マスクを弱くする
-            v1 = self._mask(v1, dim=3, ratio=self.time_mask_ratio)
-            v2 = self._mask(v2, dim=3, ratio=self.time_mask_ratio)
+        v1 = self._mask(v1, dim=2, ratio=self.freq_mask_ratio)
+        v2 = self._mask(v2, dim=2, ratio=self.freq_mask_ratio)
+        v1 = self._mask(v1, dim=3, ratio=self.time_mask_ratio)
+        v2 = self._mask(v2, dim=3, ratio=self.time_mask_ratio)
         return v1, v2
