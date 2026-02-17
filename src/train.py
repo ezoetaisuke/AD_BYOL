@@ -1,97 +1,61 @@
-# =========================================================
-# train.py（学習ルーチン本体）
-#
-# 主な責務:
-# - AE（Conv2dAE）を OK（正常）データのみで学習し、最良epochのcheckpointを保存する
-# - 学習過程を metrics_csv / learning_curve_png として保存する
-#
-# 入力:
-# - cfg: YAMLからロードされたネスト辞書（main_train.py で読み込む想定）
-# 出力:
-# - checkpoint_best（torch.save）
-# - metrics_csv（学習ログ）
-# - learning_curve_png（学習曲線）
-# =========================================================
-
-# --- 標準ライブラリ ---
 import os
-import math
-import numpy as np
+import time
 import torch
 from torch import optim
 from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
-import time
 
-# --- 自作モジュール（データ/モデル/ユーティリティ） ---
 from .datasets import create_loader
-from .model_ae import Conv2dAE, recon_loss
-from .utils import (set_seed, ensure_dir, save_metrics_csv, plot_learning_curve,)
+from .model_byol import BYOLModel, BYOLAugment
+from .utils import set_seed, ensure_dir, save_metrics_csv, plot_learning_curve
 
 
-
-# ---------------------------------------------------------
-# 学習エントリポイント
-# - AEの学習（train/val）
-# - 最良checkpoint保存
-# - （任意）Mahalanobis統計推定、Selective Mahalanobis統計推定
-# ---------------------------------------------------------
 def run_train(cfg):
-
-    # cfg['seed']: 乱数シード（再現性担保の基本）
+    """正常データのみでBYOL/BYOL-Aを学習し、最良重みを保存する。"""
     set_seed(cfg["seed"])
-
-    # device: 学習を実行するデバイス（CUDAがあればGPU）
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # cfg['data']['train_ok_glob']: 学習用 OK データのglob（例: 'data/train_ok/**/*.npy'）
-    # create_loader は (DataLoader, dataset_info) のような2値を返す想定（ここでは後者は未使用）
-    train_loader, _ = create_loader(cfg["data"]["train_ok_glob"], label=0, cfg=cfg, shuffle=True,drop_last=True)
+    train_loader, _ = create_loader(cfg["data"]["train_ok_glob"], label=0, cfg=cfg, shuffle=True, drop_last=True)
+    val_loader, _ = create_loader(cfg["data"]["val_ok_glob"], label=0, cfg=cfg, shuffle=False, drop_last=False)
 
-    # cfg['data']['val_ok_glob']: 検証用 OK データのglob
-    val_loader, _ = create_loader(cfg["data"]["val_ok_glob"], label=0, cfg=cfg, shuffle=False,drop_last=False)
+    # ===== BYOLモデル初期化 =====
+    byol_cfg = cfg["model"]["byol"]
+    model = BYOLModel(
+        in_ch=1,
+        encoder_hidden=byol_cfg["encoder_hidden"],
+        feat_dim=byol_cfg["feat_dim"],
+        projector_hidden=byol_cfg["projector_hidden"],
+        predictor_hidden=byol_cfg["predictor_hidden"],
+        ema_decay=byol_cfg["ema_decay"],
+    ).to(device)
 
-    # cfg['model']['type']: モデル種類（本実装はconv2d_ae固定）
-    assert cfg["model"]["type"] == "conv2d_ae"
+    augment = BYOLAugment(
+        mode=cfg["ssl"]["method"],
+        noise_std=cfg["ssl"]["augment"]["noise_std"],
+        time_mask_ratio=cfg["ssl"]["augment"]["time_mask_ratio"],
+        freq_mask_ratio=cfg["ssl"]["augment"]["freq_mask_ratio"],
+    )
 
-    # cfg['model']['bottleneck_dim']: 潜在次元（圧縮率に影響）
-    model = Conv2dAE(in_ch=1, bottleneck_dim=cfg["model"]["bottleneck_dim"]).to(device)
-
-    # warm-up forward: lazy形状確定のために1回だけforward（train_loaderが空だとStopIteration）
-    x0, _, _ = next(iter(train_loader))
-    x0 = x0.to(device)
-    with torch.no_grad():
-        _ = model(x0)
-    model.to(device)
-
-    # Optimizer（Adam）: cfg['train'] から lr/betas/weight_decay を参照
-    optimizer = optim.Adam(
+    optimizer = optim.AdamW(
         model.parameters(),
         lr=cfg["train"]["lr"],
         betas=tuple(cfg["train"]["betas"]),
         weight_decay=cfg["train"]["weight_decay"],
     )
-
-    # Scheduler（ReduceLROnPlateau）: cfg['schedule']['plateau'] を参照（val_loss停滞でlr減衰）
     scheduler = ReduceLROnPlateau(
-        optimizer, mode="min",
+        optimizer,
+        mode="min",
         factor=cfg["schedule"]["plateau"]["factor"],
         patience=cfg["schedule"]["plateau"]["patience"],
-        min_lr=cfg["schedule"]["plateau"]["min_lr"]
+        min_lr=cfg["schedule"]["plateau"]["min_lr"],
     )
 
-    # AMP（混合精度）: cfg['train']['amp']=True かつ CUDA の場合のみ有効
-    use_amp = bool(cfg["train"]["amp"]) and (device.type == "cuda")
+    use_amp = bool(cfg["train"]["amp"]) and device.type == "cuda"
     scaler = GradScaler(enabled=use_amp)
 
-    # cfg['train']['grad_clip_norm']: 勾配クリッピング上限
-    max_norm = cfg["train"]["grad_clip_norm"]
-
-    # cfg['output_dir']: 成果物の出力ディレクトリ
     out_dir = cfg["output_dir"]
     ensure_dir(out_dir)
-
     ckpt_path = os.path.join(out_dir, cfg["filenames"]["checkpoint_best"])
     metrics_csv = os.path.join(out_dir, cfg["filenames"]["metrics_csv"])
     lc_png = os.path.join(out_dir, cfg["filenames"]["learning_curve_png"])
@@ -99,117 +63,83 @@ def run_train(cfg):
     ensure_dir(metrics_csv)
     ensure_dir(lc_png)
 
-    # cfg['train']['epochs']: 最大epoch数
-    # cfg['loss']['recon_type']/['gaussian_nll_sigma2']: 再構成損失の定義に関与
-    epochs = cfg["train"]["epochs"]
-    recon_type = cfg["loss"]["recon_type"]
-    sigma2 = float(cfg["loss"].get("gaussian_nll_sigma2", 1.0))
+    patience = int(cfg["schedule"]["early_stopping"]["patience"])
+    max_norm = float(cfg["train"]["grad_clip_norm"])
+    epochs = int(cfg["train"]["epochs"])
 
     history = []
-
-    # 早期終了
-    monitor_best = float("inf")
-    epochs_no_improve = 0
-    patience = int(cfg["schedule"]["early_stopping"]["patience"])
+    best_val = float("inf")
+    wait = 0
 
     autocast_kwargs = {"device_type": "cuda", "dtype": torch.float16, "enabled": use_amp}
 
     for epoch in range(1, epochs + 1):
-        
-        # epoch ループ開始（train→val→scheduler→checkpoint→ログ）
         t0 = time.time()
 
-        # ------------------------------
-        # Train phase
-        # ------------------------------
+        # ===== 学習フェーズ =====
         model.train()
-        train_loss_sum = 0.0
-        train_n = 0
-
-        for step, (x, _, _) in enumerate(tqdm(train_loader, desc=f"train epoch {epoch}/{epochs}")):
-            
-            # ミニバッチ学習（x: [B,1,H,W]想定 / 実際はDataset実装に依存）
+        train_sum, train_n = 0.0, 0
+        for x, _, _ in tqdm(train_loader, desc=f"train epoch {epoch}/{epochs}"):
             x = x.to(device)
+            x1, x2 = augment(x)
 
-            # 勾配初期化（set_to_none=Trueでメモリ効率向上）
             optimizer.zero_grad(set_to_none=True)
-
-            # autocast: AMP有効時のみfloat16混在で計算
             with autocast(**autocast_kwargs):
+                loss = model.byol_loss(x1, x2)
 
-                x_hat, _ = model(x)
-
-                # recon_loss: 正常データをよく再構成できるように学習（異常スコアの基盤）
-                loss = recon_loss(x, x_hat, recon_type, sigma2)
-
-            # AMP対応のbackward（scale/unscale→clip→step→update）
-            scaler.scale(loss).backward()   # 損失に拡大係数を掛けてbackward。
-            scaler.unscale_(optimizer)  # Optimizerが持つparamの勾配を "実スケール" に戻す。
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            scaler.step(optimizer)  # 勾配にInf/NaNが混じっていればstepを自動スキップ。
-            scaler.update() # スケール係数を自動調整。
+            scaler.step(optimizer)
+            scaler.update()
+            model.update_target()
 
-            # ログ用
             bs = x.size(0)
-            train_loss_sum += float(loss.item()) * bs
+            train_sum += float(loss.item()) * bs
             train_n += bs
-        
-        train_loss = train_loss_sum / max(1, train_n)
+        train_loss = train_sum / max(1, train_n)
 
-        # ------------------------------
-        # Validation phase（βは当該エポックの代表値で評価）
-        # ------------------------------
+        # ===== 検証フェーズ（同じBYOL損失で監視） =====
         model.eval()
-        val_loss_sum = 0.0
-        val_n = 0
+        val_sum, val_n = 0.0, 0
         with torch.no_grad():
-            for (x, _, _) in tqdm(val_loader, desc=f"val epoch {epoch}/{epochs}"):
+            for x, _, _ in tqdm(val_loader, desc=f"val epoch {epoch}/{epochs}"):
                 x = x.to(device)
+                x1, x2 = augment(x)
                 with autocast(**autocast_kwargs):
-                    x_hat, _ = model(x)
-                    loss = recon_loss(x, x_hat, recon_type, sigma2)
-                
+                    vloss = model.byol_loss(x1, x2)
                 bs = x.size(0)
-                val_loss_sum += float(loss.item()) * bs
+                val_sum += float(vloss.item()) * bs
                 val_n += bs
-        
-        val_loss = val_loss_sum / max(1, val_n)
+        val_loss = val_sum / max(1, val_n)
 
-        # scheduler更新（Plateauはval_lossを監視）
         scheduler.step(val_loss)
 
-        # best更新時のみcheckpoint保存
-        improved = val_loss < monitor_best
+        improved = val_loss < best_val
         if improved:
-            monitor_best = val_loss
-            epochs_no_improve = 0
+            best_val = val_loss
+            wait = 0
             torch.save({"model": model.state_dict(), "cfg": cfg}, ckpt_path)
         else:
-            epochs_no_improve += 1
+            wait += 1
 
-        # ロギング
-        rec = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "lr": float(optimizer.param_groups[0]["lr"])
-        }
-        history.append(rec)
-
-        # metricsをCSV保存（運用上の監査・再現性に有効）
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "lr": float(optimizer.param_groups[0]["lr"]),
+                "time_sec": round(time.time() - t0, 2),
+            }
+        )
         save_metrics_csv(metrics_csv, history)
-
-        # 学習曲線PNGを更新保存（可視化）
         plot_learning_curve(lc_png, history)
 
-        print(f"[Epoch {epoch}]  train_loss={train_loss:.6f} val_loss={val_loss:.6f} " 
-              f"{'BEST ✔' if improved else ''}")
+        print(f"[Epoch {epoch}] train_byol={train_loss:.6f} val_byol={val_loss:.6f} {'BEST ✔' if improved else ''}")
 
-        # Early stopping 条件を満たしたら終了
-        if epochs_no_improve >= patience:
-            print(f"Early stopping at epoch {epoch} (no improve {patience} epochs).")
+        if wait >= patience:
+            print(f"Early stopping at epoch {epoch}")
             break
 
-    print(f"Training done. Best checkpoint saved at: {ckpt_path}")
-
+    print(f"Training done. checkpoint: {ckpt_path}")
     return ckpt_path

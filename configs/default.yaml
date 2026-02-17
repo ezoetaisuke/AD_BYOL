@@ -136,9 +136,21 @@ data:
 # Model / Loss
 # =========================
 model:
-  type: "conv2d_ae"
-  bottleneck_dim: 256 # AE のボトルネック次元（フラット後に全結合で圧縮）
+  type: "byol"
+  byol:
+    encoder_hidden: 64
+    feat_dim: 128
+    projector_hidden: 256
+    predictor_hidden: 256
+    ema_decay: 0.99
 
+ssl:
+  # "byol" / "byol-a" を切替可能
+  method: "byol-a"
+  augment:
+    noise_std: 0.02
+    time_mask_ratio: 0.10
+    freq_mask_ratio: 0.12
 
 
 loss:
@@ -175,7 +187,7 @@ loader:
 # =========================
 scoring:
   # primary: ["recon_mse","recon_l1","mahala","mahalanobis","selective_mahala"]
-  primary: "recon_mse"
+  primary: "mahala"
   aggregate_method: "topk_mean"  # ["mean","max","topk_mean"]
   topk_ratio: 0.1
 
